@@ -1,0 +1,226 @@
+name: pre-commit
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-all-files:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # Existing lint debt is measured against this immutable, reviewed commit.
+      BASELINE_SHA: "23711d39494c42c0d3d727e7737ec7ebc47d2a3d"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The tracked sphinx_source_code gitlink has no .gitmodules entry.
+          # actions/checkout's credential cleanup traverses that broken link
+          # even with submodules disabled. Fetch without submodule traversal.
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          auth_header=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)
+          echo "::add-mask::$auth_header"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="http.$GITHUB_SERVER_URL/.extraheader" \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_header" \
+            git -c protocol.version=2 fetch --depth=1 --no-tags \
+              --no-recurse-submodules origin "$GITHUB_SHA"
+          git -c submodule.recurse=false checkout --detach --force FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="http.$GITHUB_SERVER_URL/.extraheader" \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_header" \
+            git -c protocol.version=2 fetch --depth=1 --no-tags \
+              --no-recurse-submodules origin "$BASELINE_SHA"
+          git -c submodule.recurse=false worktree add --detach \
+            "$RUNNER_TEMP/pre-commit-baseline" "$BASELINE_SHA"
+
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.8"
+          cache: pip
+          cache-dependency-path: |
+            .pre-commit-config.yaml
+            .github/workflows/pre-commit.y*
+
+      - name: Install pre-commit tooling
+        run: |
+          python -m pip install \
+            pip==24.0 setuptools==65.7.0 wheel==0.38.4 \
+            pre-commit==3.5.0 virtualenv==20.26.6 PyYAML==6.0.2
+          python -m pip check
+
+      - name: Prepare CI hook configuration
+        run: |
+          # Normalize legacy configuration in runner temp storage only.
+          # Keep the tracked config, source, hook versions and rules unchanged.
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import yaml
+
+          config = yaml.safe_load(Path(".pre-commit-config.yaml").read_text())
+          config["default_language_version"] = {"python": "python3.8"}
+          for repo in config["repos"]:
+              if repo["repo"] == "https://gitlab.com/pycqa/flake8":
+                  repo["repo"] = "https://github.com/PyCQA/flake8"
+              for hook in repo["hooks"]:
+                  excluded = hook.get("exclude")
+                  if isinstance(excluded, list):
+                      hook["exclude"] = "(?:" + "|".join(excluded) + ")"
+                  dependencies = hook.setdefault("additional_dependencies", [])
+                  dependencies.append("setuptools==65.7.0")
+                  if hook["id"] == "flake8":
+                      dependencies[:] = [
+                          "flake8-import-order==0.18.2"
+                          if item == "flake8-import-order" else item
+                          for item in dependencies
+                      ]
+                  elif hook["id"] == "mypy":
+                      dependencies.append("typed-ast==1.4.3")
+
+          config_path = Path(os.environ["RUNNER_TEMP"]) / "pre-commit-ci.yaml"
+          config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+          with open(os.environ["GITHUB_ENV"], "a") as stream:
+              stream.write(f"PRE_COMMIT_CONFIG={config_path}\n")
+              stream.write(f"PRE_COMMIT_HOME={os.environ['RUNNER_TEMP']}/pre-commit-cache\n")
+          PY
+          PRE_COMMIT_HOME="$RUNNER_TEMP/pre-commit-cache" \
+            python -m pre_commit validate-config "$RUNNER_TEMP/pre-commit-ci.yaml"
+
+      - name: Cache hook environments
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PRE_COMMIT_HOME }}
+          key: pre-commit-${{ runner.os }}-python3.8-${{ hashFiles('.pre-commit-config.yaml', '.github/workflows/pre-commit.y*') }}
+
+      - name: Install all hook environments
+        run: |
+          python -m pre_commit install-hooks --config "$PRE_COMMIT_CONFIG"
+
+      - name: Check Python syntax
+        run: |
+          python - <<'PY'
+          import ast
+          import subprocess
+          from pathlib import Path
+
+          files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          count = 0
+          for name in files:
+              if name.endswith(".py"):
+                  ast.parse(Path(name).read_bytes(), filename=name)
+                  count += 1
+          print(f"Python 3.8 syntax validated for {count} tracked Python files.")
+          PY
+
+      - name: Run all hooks and reject new lint violations
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          import yaml
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          config_path = os.environ["PRE_COMMIT_CONFIG"]
+          config = yaml.safe_load(Path(config_path).read_text())
+          expected_hooks = {
+              hook.get("name", hook["id"])
+              for repo in config["repos"] for hook in repo["hooks"]
+          }
+          report_dir = temp / "pre-commit-reports"
+          report_dir.mkdir(exist_ok=True)
+
+          def check(directory, label):
+              result = subprocess.run(
+                  [sys.executable, "-m", "pre_commit", "run", "--config", config_path,
+                   "--all-files", "--show-diff-on-failure", "--color", "never"],
+                  cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              (report_dir / f"{label}.log").write_text(result.stdout)
+              if result.returncode not in (0, 1):
+                  raise RuntimeError(f"{label}: pre-commit execution failed:\n{result.stdout}")
+
+              diagnostics = Counter()
+              seen = set()
+              failed = set()
+              hook_name = None
+              for line in result.stdout.splitlines():
+                  heading = re.match(r"^(.+?)\.{3,}(Passed|Failed|Skipped)$", line)
+                  if heading:
+                      hook_name = heading.group(1).strip()
+                      hook_name = hook_name.replace("(no files to check)", "").strip()
+                      seen.add(hook_name)
+                      if heading.group(2) == "Failed":
+                          failed.add(hook_name)
+                  elif re.match(r"^.+\.py(?::\d+(?::\d+)?)?: (?:error:|[A-Z]\d{3}\b)", line):
+                      diagnostics[(hook_name, line)] += 1
+
+              if seen != expected_hooks:
+                  raise RuntimeError(f"{label}: not all hooks ran:\n{result.stdout}")
+              diagnosed = {name for name, _ in diagnostics}
+              if failed - diagnosed or bool(result.returncode) != bool(failed):
+                  raise RuntimeError(f"{label}: hook failed without recognized lint diagnostics:\n{result.stdout}")
+              print(f"{label}: {sum(diagnostics.values())} existing lint diagnostics; "
+                    f"{len(seen)} hooks executed.")
+              return diagnostics
+
+          baseline = check(temp / "pre-commit-baseline", "baseline")
+          current = check(Path.cwd(), "current")
+          added = current - baseline
+          fixed = baseline - current
+          lines = [
+              "## Pre-commit regression check",
+              f"Baseline commit: `{os.environ['BASELINE_SHA']}`",
+              f"Existing baseline diagnostics: {sum(baseline.values())}",
+              f"Current diagnostics: {sum(current.values())}",
+              f"New diagnostics: {sum(added.values())}",
+              f"Removed diagnostics: {sum(fixed.values())}",
+              "",
+              "All original hooks run on both revisions. Existing violations are retained in the logs; "
+              "new violations and tool execution failures fail this check.",
+          ]
+          if any("Duplicate module" in message for _, message in current):
+              lines.append("The existing duplicate-module error still limits mypy analysis; "
+                           "this is not a clean full-project type check.")
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n\n".join(lines) + "\n")
+          for (hook, message), count in added.items():
+              print(f"{hook}: {message} (new occurrences: {count})")
+          if added:
+              raise SystemExit("New lint violations found; see the uploaded logs.")
+          if current:
+              print("::warning::Existing lint violations match the fixed baseline. "
+                    "See the job summary and artifact logs; the source is not lint-clean.")
+          print("PASS: no new lint violations; original source files were not modified.")
+          PY
+
+      - name: Upload complete lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-commit-reports
+          path: ${{ runner.temp }}/pre-commit-reports
+          if-no-files-found: warn
