@@ -23,9 +23,23 @@ jobs:
         shell: bash
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The tracked sphinx_source_code gitlink has no .gitmodules entry.
+          # actions/checkout's credential cleanup traverses that broken link
+          # even with submodules disabled. Fetch without submodule traversal.
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          auth_header=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)
+          echo "::add-mask::$auth_header"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="http.$GITHUB_SERVER_URL/.extraheader" \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_header" \
+            git -c protocol.version=2 fetch --depth=1 --no-tags \
+              --no-recurse-submodules origin "$GITHUB_SHA"
+          git -c submodule.recurse=false checkout --detach --force FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Set up Python 3.8
         uses: actions/setup-python@v6
